@@ -1,0 +1,38 @@
+# ── Audio I/O ──────────────────────────────────────────────────────────
+sounddevice>=0.4.6
+numpy>=1.24
+
+# ── Wake word ──────────────────────────────────────────────────────────
+openwakeword>=0.6.0
+
+# ── VAD ────────────────────────────────────────────────────────────────
+torch>=2.0.0           # Silero VAD; CPU-only is fine for Phase 1
+torchaudio>=2.0.0      # required by silero torch.hub loader
+
+# ── STT ────────────────────────────────────────────────────────────────
+faster-whisper>=1.0.0
+
+# ── TTS (primary) ──────────────────────────────────────────────────────
+kokoro-onnx>=0.4.0     # requires onnxruntime; model files downloaded separately
+
+# ── TTS (fallback) ─────────────────────────────────────────────────────
+pyttsx3>=2.90
+
+# ── Config ─────────────────────────────────────────────────────────────
+pydantic>=2.0
+
+# ── Phase 2+ (not needed yet, listed for tracking) ─────────────────────
+# langchain>=0.2
+# langchain-ollama>=0.1
+# langchain-community>=0.2
+# ollama>=0.2
+# duckduckgo-search>=6.0
+# chromadb>=0.5
+# sentence-transformers>=3.0
+# fastapi>=0.111
+# uvicorn>=0.29
+# psutil>=5.9
+# pyautogui>=0.9
+
+# ── Windows-only (conditional) ─────────────────────────────────────────
+# pycaw>=20230407       # install only on Windows: pip install pycaw

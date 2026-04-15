@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "voice-os"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = []   # managed via requirements.txt during development
+
+[project.scripts]
+voice-os = "voice_os.main:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["voice_os*"]

@@ -1,0 +1,2 @@
+[console_scripts]
+voice-os = voice_os.main:main

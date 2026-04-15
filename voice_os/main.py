@@ -1,19 +1,22 @@
 """
-VoiceOS — Phase 1 entry point.
+VoiceOS — Phase 2 entry point.
 
 State machine:
     IDLE  →  ACTIVE  →  PROCESSING  →  SPEAKING  →  IDLE
                ↑                                       │
                └──────────── idle timer fires ─────────┘
 
-Phase 1 goal: wake word → VAD captures command → Whisper transcribes →
-              TTS echoes text back.  No LLM involved yet.
+Phase 2 adds:
+  - LangChain ReAct agent (Ollama) with volume, open-app, and system-control tools
+  - In-session memory (last 5 turns), cleared on idle timeout
+  - WW listener muted during all TTS playback (fixes own-voice false triggers)
+  - Wake phrase stripped from Whisper transcription
 """
 from __future__ import annotations
 
 import logging
+import re
 import signal
-import sys
 import threading
 from enum import Enum, auto
 
@@ -23,12 +26,13 @@ from voice_os.core.wake_word import WakeWordListener
 from voice_os.core.vad import VADRecorder
 from voice_os.core.speech_to_text import WhisperTranscriber
 from voice_os.core.tts.pyttsx3_tts import build_tts_service
+from voice_os.agent.executor import AgentRunner
 
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
     datefmt="%H:%M:%S",
 )
@@ -41,7 +45,7 @@ logger = logging.getLogger("voice_os.main")
 class State(Enum):
     IDLE       = auto()
     ACTIVE     = auto()   # capturing utterance
-    PROCESSING = auto()   # transcribing
+    PROCESSING = auto()   # transcribing + agent
     SPEAKING   = auto()   # TTS playing
 
 
@@ -51,9 +55,16 @@ class State(Enum):
 
 IDLE_TIMEOUT_SECS = 60   # 1 minute of inactivity → session clear + speak notice
 
+# Words to strip from the front of the Whisper transcription.
+# Covers the Phase 1 placeholder wake word ("alexa") plus the configured phrase.
+_WAKE_WORD_TOKENS = re.compile(
+    r"^(?:alexa|hey\s+alexa|os\s+assistant|hey\s+os|assistant)[,.\s]*",
+    re.IGNORECASE,
+)
+
 
 class VoiceAssistant:
-    """Orchestrates the 4-state voice loop for Phase 1."""
+    """Orchestrates the 4-state voice loop."""
 
     def __init__(self) -> None:
         self._state = State.IDLE
@@ -78,18 +89,21 @@ class VoiceAssistant:
             mic_manager=self._mic,
         )
 
+        logger.info("Building agent runner…")
+        self._agent = AgentRunner(tts=self._tts, stt=self._stt, vad=self._vad)
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
     def run(self) -> None:
         """Start the assistant and block until shutdown (Ctrl-C / SIGTERM)."""
-        logger.info("VoiceOS Phase 1 starting…")
+        logger.info("VoiceOS Phase 2 starting…")
+        # Speak startup message *before* WW listener starts — no need to mute WW.
         self._tts.speak(f"Voice OS is ready. Say '{settings.wake_phrase}' to begin.")
         self._reset_idle_timer()
         self._ww.start()
 
-        # Block the main thread until a shutdown signal arrives
         shutdown = threading.Event()
 
         def _sig_handler(sig, frame):
@@ -107,6 +121,7 @@ class VoiceAssistant:
         if self._idle_timer:
             self._idle_timer.cancel()
         self._ww.stop()
+        # WW is stopped — no need to mute it; speak directly.
         self._tts.speak("Goodbye.")
         logger.info("VoiceOS stopped.")
 
@@ -118,47 +133,70 @@ class VoiceAssistant:
         """Called by WakeWordListener when the wake phrase is detected."""
         with self._state_lock:
             if self._state != State.IDLE:
-                logger.info("Wake word ignored — current state is %s, not IDLE.", self._state.name)
+                logger.info(
+                    "Wake word ignored — current state is %s, not IDLE.",
+                    self._state.name,
+                )
                 self._ww.resume()
                 return
             self._set_state(State.ACTIVE)
 
         self._reset_idle_timer()
-        threading.Thread(target=self._capture_and_respond_safe, daemon=True).start()
+        threading.Thread(
+            target=self._capture_and_respond_safe, daemon=True
+        ).start()
 
     def _capture_and_respond_safe(self) -> None:
         try:
             self._capture_and_respond()
         except Exception:
-            logger.exception("Unhandled error in capture/respond pipeline — returning to IDLE.")
+            logger.exception(
+                "Unhandled error in capture/respond pipeline — returning to IDLE."
+            )
             self._go_idle()
 
     def _capture_and_respond(self) -> None:
         """ACTIVE → PROCESSING → SPEAKING → IDLE."""
-        # --- ACTIVE: capture utterance ---
+
+        # --- ACTIVE: signal to user, then capture utterance ---
+        # WW listener is already paused (paused by WakeWordListener._run
+        # before calling on_detected); _speak() double-pauses safely.
         logger.info("[ACTIVE] Capturing utterance via VAD…")
-        self._tts.speak("Listening.")
+        self._speak("Listening.")
         audio = self._vad.record_until_silence()
         self._reset_idle_timer()
 
         # --- PROCESSING: transcribe ---
         self._set_state(State.PROCESSING)
         logger.info("[PROCESSING] Transcribing…")
-        text = self._stt.transcribe(audio)
+        raw_text = self._stt.transcribe(audio)
         self._reset_idle_timer()
 
-        if not text:
+        if not raw_text:
             logger.warning("Transcription returned empty — returning to IDLE.")
-            self._tts.speak("Sorry, I didn't catch that.")
+            self._speak("Sorry, I didn't catch that.")
             self._go_idle()
             return
 
-        logger.info("[PROCESSING] Transcribed: '%s'", text)
+        # Strip wake-phrase prefix that Whisper may include in the transcript.
+        text = _WAKE_WORD_TOKENS.sub("", raw_text).strip()
+        if not text:
+            logger.warning("Nothing left after stripping wake phrase — returning to IDLE.")
+            self._speak("Sorry, I didn't catch that.")
+            self._go_idle()
+            return
 
-        # --- SPEAKING: echo back (Phase 1 — no LLM) ---
+        logger.info("[PROCESSING] Transcribed: '%s' (raw: '%s')", text, raw_text)
+
+        # --- PROCESSING: run agent ---
+        logger.info("[PROCESSING] Running agent…")
+        response = self._agent.handle(text)
+        self._reset_idle_timer()
+
+        # --- SPEAKING: TTS ---
         self._set_state(State.SPEAKING)
-        logger.info("[SPEAKING] Echoing transcription.")
-        self._tts.speak(f"You said: {text}")
+        logger.info("[SPEAKING] Speaking response.")
+        self._speak(response)
         self._reset_idle_timer()
 
         # --- back to IDLE ---
@@ -175,15 +213,28 @@ class VoiceAssistant:
             current = self._state
         logger.info("Idle timeout fired (state=%s).", current.name)
         if current == State.IDLE:
-            self._tts.speak("Going to idle state.")
-            # In Phase 2+ this will also clear session memory
-            logger.info("Session memory cleared (Phase 2).")
-        # Reset the timer so we keep firing periodically while idle
-        # (keeps the "going to idle" message from repeating — Phase 1 only notifies once)
+            # Mute WW while speaking so TTS doesn't trigger itself.
+            self._speak("Going to idle state.")
+            self._ww.resume()          # resume — still idle after speaking
+            self._agent.clear_session()
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _speak(self, text: str) -> None:
+        """
+        Speak ``text`` while keeping the wake-word listener muted.
+
+        Always calls pause() before speaking.  Callers that want to resume
+        WW afterwards must do so explicitly (via _go_idle or _ww.resume()).
+
+        Rationale: the TTS audio leaks into the microphone and can falsely
+        trigger the wake-word detector (the so-called "own voice" problem).
+        Muting WW for the entire duration of TTS playback prevents this.
+        """
+        self._ww.pause()
+        self._tts.speak(text)
 
     def _set_state(self, new_state: State) -> None:
         with self._state_lock:

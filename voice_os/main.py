@@ -15,6 +15,7 @@ Phase 2 adds:
 from __future__ import annotations
 
 import logging
+import pathlib
 import re
 import signal
 import threading
@@ -37,6 +38,18 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("voice_os.main")
+
+# Dedicated conversation log — one line per user turn, tool execution, and response.
+_CONV_LOG_PATH = pathlib.Path.home() / ".voice_os" / "conversation.log"
+_CONV_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+_conv_file_handler = logging.FileHandler(_CONV_LOG_PATH, encoding="utf-8")
+_conv_file_handler.setFormatter(
+    logging.Formatter("%(asctime)s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+)
+_conv_logger = logging.getLogger("voice_os.conversation")
+_conv_logger.setLevel(logging.INFO)
+_conv_logger.addHandler(_conv_file_handler)
+_conv_logger.propagate = False   # keep conversation events out of the debug log
 
 # ---------------------------------------------------------------------------
 # State enum

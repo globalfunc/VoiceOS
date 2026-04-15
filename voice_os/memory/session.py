@@ -37,6 +37,10 @@ class SessionMemory:
             lines.append(f"Assistant: {assistant}")
         return "\n".join(lines)
 
+    def get_turns(self) -> list[tuple[str, str]]:
+        """Return all stored turns as a list of (user, assistant) pairs."""
+        return list(self._history)
+
     def clear(self) -> None:
         """Wipe all stored turns (called on idle timeout)."""
         self._history.clear()

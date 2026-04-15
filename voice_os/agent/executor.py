@@ -199,17 +199,25 @@ class AgentRunner:
         from voice_os.agent.prompts import SYSTEM_PROMPT
         from voice_os.agent.tools.volume_control import VolumeControlTool
         from voice_os.agent.tools.open_app import OpenAppTool
+        from voice_os.agent.tools.close_app import CloseAppTool
         from voice_os.agent.tools.system_control import SystemControlTool
 
         # --- Build tools -----------------------------------------------
         try:
             volume_tool = VolumeControlTool()
-            open_app_tool = OpenAppTool()
+            open_app_tool = OpenAppTool(
+                speak=self._tts.speak,
+                listen_for_response=self._listen_for_response,
+            )
+            close_app_tool = CloseAppTool(
+                speak=self._tts.speak,
+                listen_for_response=self._listen_for_response,
+            )
             system_tool = SystemControlTool(
                 speak=self._tts.speak,
                 listen_for_cancel=self._listen_for_cancel,
             )
-            tools = [volume_tool, open_app_tool, system_tool]
+            tools = [volume_tool, open_app_tool, close_app_tool, system_tool]
             logger.debug("AgentRunner: tools built: %s", [t.name for t in tools])
         except Exception as exc:
             logger.error("Failed to instantiate agent tools: %s", exc, exc_info=True)
@@ -283,6 +291,33 @@ class AgentRunner:
             logger.error("Failed to build AgentExecutor: %s", exc)
             return None
 
+    def _listen_for_response(self) -> str:
+        """
+        Record up to 10 seconds and return the transcribed text.
+
+        Used by open_app during fuzzy-match confirmation ("Did you mean X?").
+        Returns an empty string on timeout or transcription failure.
+        """
+        result: list[str] = [""]
+        done = threading.Event()
+
+        def _record_and_transcribe() -> None:
+            try:
+                audio = self._vad.record_until_silence()
+                if audio is not None and len(audio) > 0:
+                    text = self._stt.transcribe(audio) or ""
+                    logger.info("Confirmation response transcribed: '%s'", text)
+                    result[0] = text
+            except Exception as exc:
+                logger.error("_listen_for_response error: %s", exc)
+            finally:
+                done.set()
+
+        t = threading.Thread(target=_record_and_transcribe, daemon=True)
+        t.start()
+        done.wait(timeout=10.0)
+        return result[0]
+
     def _listen_for_cancel(self) -> bool:
         """
         Record up to 10 seconds and return True if the user said "cancel".
@@ -291,8 +326,6 @@ class AgentRunner:
         The VAD recorder handles end-of-speech detection naturally;
         we impose a 10-second overall cap via a daemon thread + Event.
         """
-        import numpy as np
-
         result: list[bool] = [False]
         done = threading.Event()
 

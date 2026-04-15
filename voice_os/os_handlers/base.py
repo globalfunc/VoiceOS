@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 
 class OSHandler(ABC):
@@ -26,6 +26,49 @@ class OSHandler(ABC):
     @abstractmethod
     def list_apps(self) -> List[str]:
         """List installed / known application names (best-effort)."""
+
+    def find_app_candidates(
+        self, query: str, top_n: int = 3, min_score: float = 0.5
+    ) -> List[Tuple[str, str, float]]:
+        """
+        Fuzzy-match ``query`` against installed app names.
+
+        Returns up to ``top_n`` tuples of (display_name, launch_path, score)
+        sorted by descending score.  Only results with score >= ``min_score``
+        are included.  Default implementation returns an empty list; platform
+        handlers override for richer results.
+        """
+        return []
+
+    # ------------------------------------------------------------------
+    # Process management
+    # ------------------------------------------------------------------
+
+    def find_processes(self, name: str) -> List[Tuple[int, str]]:
+        """
+        Find running processes whose command line contains ``name`` (substring,
+        case-insensitive).  Returns [(pid, process_name), ...].
+        Default: empty list.  Platform handlers override.
+        """
+        return []
+
+    def find_processes_fuzzy(
+        self, query: str, min_score: float = 0.5
+    ) -> List[Tuple[str, List[int], float]]:
+        """
+        Fuzzy-match ``query`` against running process names.
+        Returns [(process_name, [pids], score), ...] sorted descending by score.
+        Default: empty list.  Platform handlers override.
+        """
+        return []
+
+    def close_processes(self, pids: List[int]) -> bool:
+        """
+        Gracefully terminate the given PIDs (SIGTERM / equivalent).
+        Returns True if all signals were sent without error.
+        Default: False.  Platform handlers override.
+        """
+        return False
 
     # ------------------------------------------------------------------
     # Volume

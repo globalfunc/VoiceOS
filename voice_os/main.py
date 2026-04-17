@@ -115,6 +115,12 @@ _WAKE_WORD_TOKENS = re.compile(
     re.IGNORECASE,
 )
 
+# Phrases that dismiss the assistant back to idle and clear the session.
+_DISMISS_PATTERN = re.compile(
+    r"^(?:bye|goodbye|see\s+you|that'?s?\s+all|dismiss)[\s,.]*(alexa)?[\s.]*$",
+    re.IGNORECASE,
+)
+
 
 class VoiceAssistant:
     """Orchestrates the 4-state voice loop."""
@@ -240,6 +246,14 @@ class VoiceAssistant:
             return
 
         logger.info("[PROCESSING] Transcribed: '%s' (raw: '%s')", text, raw_text)
+
+        # --- PROCESSING: check for dismiss command before hitting the agent ---
+        if _DISMISS_PATTERN.match(text):
+            logger.info("[PROCESSING] Dismiss command detected — going idle.")
+            self._agent.clear_session()
+            self._speak("Goodbye. Say the wake word when you need me.")
+            self._go_idle()
+            return
 
         # --- PROCESSING: run agent ---
         logger.info("[PROCESSING] Running agent…")

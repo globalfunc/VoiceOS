@@ -57,9 +57,21 @@ class CloseAppTool(BaseTool):
         if not app_name:
             return "Please specify an application name to close."
 
-        # ── Step 1: direct command-line substring match ────────────────
-        # pgrep -af searches the full cmdline, so "dbeaver" matches "dbeaver-ce".
-        raw_matches = handler.find_processes(app_name)
+        # ── Step 1: match by comm/binary name only (pgrep -a, no -f) ──
+        # Using fullcmd=False prevents matching processes that merely mention
+        # the app name in a path argument (e.g. java running /opt/dbeaver/...).
+        # pgrep still does regex substring matching on comm, so "dbeaver"
+        # matches comm="dbeaver-ce" and "obs" matches comm="obs".
+        raw_matches = handler.find_processes(app_name, fullcmd=False)
+        # Filter out crash-reporter and helper processes — they share the
+        # parent app's name in their path but are not the app itself.
+        # Closing helpers instead of the browser is a common false-positive.
+        _HELPER_SUFFIXES = ("crashpad", "crashpad_handler", "crash_reporter",
+                            "helper", "renderer", "gpu-process", "utility")
+        raw_matches = [
+            (pid, comm) for pid, comm in raw_matches
+            if not any(comm.lower().endswith(s) for s in _HELPER_SUFFIXES)
+        ]
         confirmed_display = app_name
 
         # ── Step 1.5: catalog bridge ───────────────────────────────────
@@ -73,7 +85,10 @@ class CloseAppTool(BaseTool):
                 exec_name = _os.path.basename(launch_path)
                 # Skip if catalog only returned a .desktop path (binary not in PATH).
                 if exec_name and not launch_path.endswith(".desktop"):
-                    bridged = handler.find_processes(exec_name)
+                    # fullcmd=False: match by binary name only, not full
+                    # cmdline.  Prevents "obs" from matching ".../blobs/..."
+                    # in unrelated processes (e.g. the ollama model runner).
+                    bridged = handler.find_processes(exec_name, fullcmd=False)
                     if bridged:
                         raw_matches = bridged
                         confirmed_display = display_name
@@ -128,33 +143,20 @@ class CloseAppTool(BaseTool):
 
             raw_matches = [(pid, proc_name) for pid in pids]
 
-        # ── Step 3: group by process name → handle multiple instances ─
+        # ── Step 3: group by process name and close all instances ─────
+        # Multi-process apps (browsers, Electron apps) spawn dozens of
+        # processes for tabs, renderers, GPU, crash reporters, etc.
+        # Asking the user to confirm each group is wrong UX — close all
+        # processes for each matched comm name silently.
         groups: Dict[str, List[int]] = defaultdict(list)
         for pid, proc_name in raw_matches:
             groups[proc_name].append(pid)
 
         parts: List[str] = []
         for proc_name, pids in groups.items():
-            # Deduplicate PIDs (find_processes may return duplicates for
-            # multi-thread processes sharing a comm name).
-            pids = list(dict.fromkeys(pids))
-
-            if len(pids) > 1 and self.speak and self.listen_for_response:
-                self.speak(
-                    f"There are {len(pids)} instances of {proc_name} running. "
-                    "Close all of them? Say yes or no."
-                )
-                response = self.listen_for_response()
-                logger.info("Multi-close confirmation for %r: %r", proc_name, response)
-                if "yes" not in response.lower():
-                    parts.append(f"Skipped {proc_name}.")
-                    continue
-
+            pids = list(dict.fromkeys(pids))  # deduplicate
             handler.close_processes(pids)
-            if len(pids) == 1:
-                parts.append(f"Closed {proc_name}.")
-            else:
-                parts.append(f"Closed {len(pids)} instances of {proc_name}.")
+            parts.append(f"Closed {proc_name}.")
 
         return " ".join(parts) if parts else f"Nothing to close for '{app_name}'."
 

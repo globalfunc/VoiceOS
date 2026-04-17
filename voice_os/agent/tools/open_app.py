@@ -12,8 +12,10 @@ This mitigates STT mis-transcriptions such as "haydysql" → HeidiSQL or
 from __future__ import annotations
 
 import logging
+import os
+import re
 import subprocess
-from typing import Callable, Optional, Type
+from typing import Callable, List, Optional, Type
 
 from langchain_classic.tools import BaseTool
 from pydantic import BaseModel, Field
@@ -130,13 +132,51 @@ class OpenAppTool(BaseTool):
 
     def _launch(self, label: str, path: str) -> str:
         """Launch ``path`` and return a spoken confirmation string."""
+        # Detach from the assistant's process group so the app lives
+        # independently and is not killed by Ctrl-C on the terminal.
+        _popen_kwargs = dict(
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
         try:
             if path.endswith(".desktop"):
-                subprocess.Popen(["xdg-open", path])
+                cmd = _exec_from_desktop(path)
+                if cmd:
+                    subprocess.Popen(cmd, **_popen_kwargs)
+                    logger.info("Launched '%s' via desktop Exec: %s", label, cmd)
+                else:
+                    name = os.path.basename(path)
+                    if name.endswith(".desktop"):
+                        name = name[:-8]
+                    subprocess.Popen(["gtk-launch", name], **_popen_kwargs)
+                    logger.info("Launched '%s' via gtk-launch %s.", label, name)
             else:
-                subprocess.Popen([path])
-            logger.info("Launched '%s' (%s).", label, path)
+                subprocess.Popen([path], **_popen_kwargs)
+                logger.info("Launched '%s' (%s).", label, path)
             return f"Opening {label}."
         except Exception as exc:
             logger.error("Failed to launch '%s': %s", label, exc)
             return f"Failed to open {label}: {exc}"
+
+
+def _exec_from_desktop(path: str) -> Optional[List[str]]:
+    """
+    Parse the Exec= line from a .desktop file and return it as a token list.
+
+    Field codes (%u, %U, %F, %f, %i, %c, %k …) are stripped — they are only
+    meaningful when a file/URI is being opened, not for bare app launches.
+    Returns None if the file cannot be read or has no valid Exec= line.
+    """
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("Exec="):
+                    cmd_str = re.sub(r"%\w", "", line[5:]).strip()
+                    tokens = cmd_str.split()
+                    return tokens if tokens else None
+    except Exception as exc:
+        logger.warning("_exec_from_desktop(%r): %s", path, exc)
+    return None

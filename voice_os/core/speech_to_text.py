@@ -27,6 +27,7 @@ class WhisperTranscriber:
 
     def __init__(self, model_name: str = _MODEL_NAME, device: str = "auto") -> None:
         self._model = self._load(model_name, device)
+        self._initial_prompt: Optional[str] = None   # built lazily on first transcribe()
 
     # ------------------------------------------------------------------
     # Public API
@@ -49,6 +50,10 @@ class WhisperTranscriber:
         # faster-whisper expects float32 in [-1, 1]
         audio_f32 = audio.astype(np.float32) / 32768.0
 
+        if self._initial_prompt is None:
+            self._initial_prompt = self._build_initial_prompt()
+            logger.debug("Whisper initial_prompt (%d chars): %s…", len(self._initial_prompt), self._initial_prompt[:120])
+
         try:
             segments, info = self._model.transcribe(
                 audio_f32,
@@ -56,6 +61,7 @@ class WhisperTranscriber:
                 beam_size=5,
                 vad_filter=True,           # internal VAD for trailing silence
                 vad_parameters=dict(min_silence_duration_ms=300),
+                initial_prompt=self._initial_prompt,
             )
             text = " ".join(seg.text for seg in segments).strip()
             logger.info("STT: '%s' (lang=%s, prob=%.2f)", text, info.language, info.language_probability)
@@ -67,6 +73,37 @@ class WhisperTranscriber:
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
+
+    def _build_initial_prompt(self) -> str:
+        """
+        Build a Whisper initial_prompt from the installed app catalog so the
+        STT model recognises proper nouns (HeidiSQL, OBS Studio, DBeaver, …)
+        instead of phonetically mangling them.
+
+        Called once on the first transcribe() and cached.  Falls back to a
+        minimal static string if the OS handler is unavailable.
+        """
+        try:
+            from voice_os.os_handlers import get_os_handler
+            names = get_os_handler().list_app_names(top_n=200)
+            # Exclude very short names (≤3 chars: "sh", "ls", "vi").
+            candidates = [n for n in names if len(n) > 3]
+            # Sort: proper nouns (mixed-case, e.g. "HeidiSQL", "OBS Studio") first
+            # so the most voice-recognition-valuable names fit within the budget.
+            # All-lowercase names ("dbeaver-ce") come second.
+            def _sort_key(n: str) -> int:
+                return 0 if not n.islower() else 1
+            candidates.sort(key=_sort_key)
+            # Whisper's initial_prompt budget is ~375 tokens (~1 500 chars).
+            joined = ", ".join(candidates)[:1400]
+            prompt = f"Voice OS commands: open, close, volume, shutdown. Apps: {joined}."
+            logger.info("Built Whisper initial_prompt from %d app names.", len(candidates))
+            return prompt
+        except Exception as exc:
+            logger.warning("Could not build dynamic Whisper prompt: %s", exc)
+            return (
+                "Voice OS assistant commands: open, close, volume, shutdown, restart, sleep."
+            )
 
     @staticmethod
     def _load(model_name: str, device: str):

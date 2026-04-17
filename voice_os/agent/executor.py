@@ -15,9 +15,11 @@ Usage (called from main.py):
 """
 from __future__ import annotations
 
+import datetime
 import logging
+import pathlib
 import threading
-from typing import TYPE_CHECKING
+from typing import IO, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from voice_os.core.tts.base import TTSService
@@ -53,9 +55,12 @@ class AgentRunner:
         self._vad = vad
 
         from voice_os.memory.session import SessionMemory
+        from voice_os.agent.error_handler import AgentInvokeErrorHandler
         self._session = SessionMemory(maxlen=5)
         self._agent = None          # built lazily
         self._build_lock = threading.Lock()
+        self._error_handler = AgentInvokeErrorHandler()
+        self._debug_fh: IO | None = None   # per-session dump file
 
     # ------------------------------------------------------------------
     # Public API
@@ -85,11 +90,18 @@ class AgentRunner:
                 "Make sure Ollama is running and try again."
             )
 
-        # Build message list: session history + current input
+        from voice_os.config.settings import settings
+
+        # Open debug file lazily (once per session).
+        if self._debug_fh is None:
+            self._debug_fh = self._open_debug_file()
+
+        # Build message list: optionally inject session history.
         messages = []
-        for user_text, ai_text in self._session.get_turns():
-            messages.append(HumanMessage(content=user_text))
-            messages.append(AIMessage(content=ai_text))
+        if not settings.stateless_commands:
+            for user_text, ai_text in self._session.get_turns():
+                messages.append(HumanMessage(content=user_text))
+                messages.append(AIMessage(content=ai_text))
         messages.append(HumanMessage(content=text))
 
         _conv_logger.info('User said: "%s"', text)
@@ -102,13 +114,17 @@ class AgentRunner:
         try:
             result = agent.invoke(
                 {"messages": messages},
-                config={"recursion_limit": 5},
+                config={"recursion_limit": 12},
             )
             all_msgs = result.get("messages", [])
+            # Only examine messages produced in this turn, not injected history.
+            new_msgs = all_msgs[len(messages):]
 
-            # Log every tool execution
-            for msg in all_msgs:
+            # Log every tool execution and track whether any tool was called.
+            tool_was_called = False
+            for msg in new_msgs:
                 if isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None):
+                    tool_was_called = True
                     for tc in msg.tool_calls:
                         _conv_logger.info(
                             'AI Assistant Executed: "%s(%s)"',
@@ -116,36 +132,75 @@ class AgentRunner:
                             tc.get("args", {}),
                         )
 
-            # Extract the final spoken response from the last AIMessage with content.
+            # Prefer the last synthesized AIMessage with text content 
+            # AI models almost always create as synth summary message after tool chain executions.
             response = ""
-            for msg in reversed(all_msgs):
+            for msg in reversed(new_msgs):
                 if isinstance(msg, AIMessage):
                     content = getattr(msg, "content", "") or ""
                     if content.strip():
                         response = content
                         break
 
-            # If the model produced no final text (tool-only turn), use the
-            # last ToolMessage as the spoken confirmation.
-            if not response.strip():
-                for msg in reversed(all_msgs):
+            # Tool-only turn (no synthesis): surface errors, accept silence for success.
+            _TOOL_ERROR_MARKERS = ("not found", "no running", "failed", "could not", "error", "cancelled")
+            if not response.strip() and tool_was_called:
+                for msg in reversed(new_msgs):
                     if isinstance(msg, ToolMessage):
                         content = getattr(msg, "content", "") or ""
-                        if content.strip():
+                        if content.strip() and any(m in content.lower() for m in _TOOL_ERROR_MARKERS):
                             response = content
-                            logger.info(
-                                "Agent: using tool result as spoken response: %r",
-                                response,
-                            )
                             break
+                # No errors found — tool executed silently, that is acceptable.
 
-            if not response.strip():
+            # Agent produced no tool calls and no text — something went wrong.
+            if not response.strip() and not tool_was_called:
                 response = _FALLBACK
 
-        except Exception as exc:
-            logger.error("AgentRunner.handle error: %s", exc)
-            response = _FALLBACK
+            # Guard: detect when the model describes an action without calling a tool.
+            _ACTION_VERBS = (
+                "open", "launch", "start", "close", "quit", "exit", "kill",
+                "shutdown", "shut down", "restart", "reboot", "sleep",
+                "volume", "louder", "quieter", "mute",
+            )
+            _REFUSAL_SIGNALS = (
+                "can't", "cannot", "couldn't", "not found", "not recognized",
+                "not installed", "sorry", "don't", "unable", "no app", "unknown",
+                "i can't help", "i cannot",
+            )
+            text_lower = text.lower()
+            response_lower = response.lower().strip()
+            if not tool_was_called and any(v in text_lower for v in _ACTION_VERBS):
+                is_refusal = any(s in response_lower for s in _REFUSAL_SIGNALS)
+                # Clarifying questions (e.g. "Did you mean HeidiSQL?") are
+                # legitimate — they are not hallucinated action confirmations.
+                is_question = response_lower.rstrip(".… ").endswith("?")
+                if not is_refusal and not is_question:
+                    # Non-refusal, non-question response to an action command
+                    # with no tool call → hallucinated confirmation, discard it.
+                    logger.warning(
+                        "Model faked a successful action for %r without calling a tool — "
+                        "discarding response %r.",
+                        text, response,
+                    )
+                    response = (
+                        "Sorry, I couldn't complete that action. Please try again."
+                    )
 
+        except Exception as exc:
+            err = self._error_handler.handle(exc)
+            logger.log(
+                err.level,
+                "Agent invoke failed: %s",
+                exc,
+                exc_info=err.level == logging.ERROR,
+            )
+            if err.clear_session:
+                self._session.clear()
+            self._session.add(text, "")
+            return err.response
+
+        self._dump_turn(messages, new_msgs, response)
         _conv_logger.info('AI Assistant responded: "%s"', response)
         logger.debug("Agent output: %r", response)
         self._session.add(text, response)
@@ -154,11 +209,74 @@ class AgentRunner:
     def clear_session(self) -> None:
         """Clear conversation history (called on idle timeout)."""
         self._session.clear()
+        if self._debug_fh is not None:
+            try:
+                self._debug_fh.write("\n=== SESSION CLEARED ===\n")
+                self._debug_fh.flush()
+                self._debug_fh.close()
+            except Exception:
+                pass
+            self._debug_fh = None
         logger.info("Session memory cleared.")
 
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
+
+    def _open_debug_file(self) -> IO | None:
+        """
+        Open (once per session) a timestamped dump file under ~/.voice_os/debug/.
+        Returns the file handle, or None if the setting is off or opening fails.
+        """
+        from voice_os.config.settings import settings
+        if not settings.debug_session_dump:
+            return None
+        try:
+            debug_dir = pathlib.Path.home() / ".voice_os" / "debug"
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = debug_dir / f"session_{ts}.log"
+            fh = path.open("w", encoding="utf-8")
+            fh.write(f"VoiceOS session dump — {ts}\n{'=' * 60}\n\n")
+            fh.flush()
+            logger.info("Debug session dump: %s", path)
+            return fh
+        except Exception as exc:
+            logger.warning("Could not open debug session dump file: %s", exc)
+            return None
+
+    def _dump_turn(
+        self,
+        messages: list,
+        new_msgs: list,
+        response: str,
+    ) -> None:
+        """Append one agent turn to the open debug file."""
+        if self._debug_fh is None:
+            return
+        from langchain_core.messages import AIMessage, ToolMessage
+        try:
+            ts = datetime.datetime.now().strftime("%H:%M:%S")
+            lines = [f"--- Turn @ {ts} ---"]
+            lines.append("[Messages sent to agent]")
+            for m in messages:
+                role = type(m).__name__.replace("Message", "")
+                content = getattr(m, "content", "") or ""
+                lines.append(f"  {role}: {content!r}")
+            lines.append("[New messages from agent]")
+            for m in new_msgs:
+                role = type(m).__name__.replace("Message", "")
+                content = getattr(m, "content", "") or ""
+                tool_calls = getattr(m, "tool_calls", None)
+                if tool_calls:
+                    lines.append(f"  {role} tool_calls: {tool_calls}")
+                if content.strip():
+                    lines.append(f"  {role}: {content!r}")
+            lines.append(f"[Final response] {response!r}\n")
+            self._debug_fh.write("\n".join(lines) + "\n")
+            self._debug_fh.flush()
+        except Exception as exc:
+            logger.warning("Failed to write debug turn: %s", exc)
 
     def _get_agent(self):
         """Return cached agent, building it if necessary."""
@@ -194,6 +312,7 @@ class AgentRunner:
         from voice_os.agent.tools.open_app import OpenAppTool
         from voice_os.agent.tools.close_app import CloseAppTool
         from voice_os.agent.tools.system_control import SystemControlTool
+        from voice_os.agent.tools.search_apps import SearchAppsTool
 
         # --- Build tools -----------------------------------------------
         try:
@@ -211,6 +330,7 @@ class AgentRunner:
                     speak=self._tts.speak,
                     listen_for_cancel=self._listen_for_cancel,
                 ),
+                SearchAppsTool(),
             ]
             logger.debug("AgentRunner: tools built: %s", [t.name for t in tools])
         except Exception as exc:

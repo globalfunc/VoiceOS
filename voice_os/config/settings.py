@@ -38,6 +38,13 @@ class Settings(BaseModel):
     ollama_base_url: str = "http://localhost:11434"
     ui_port: int = Field(default=7860, ge=1024, le=65535)
     minimal_debug_logs: bool = True
+    # When True, write a per-session message dump to ~/.voice_os/debug/.
+    # Each session gets a separate timestamped file showing exactly what
+    # messages were sent to the model and what it returned.
+    debug_session_dump: bool = True
+    # When True, session history is NOT injected into agent messages.
+    # Useful for isolating whether multi-turn context is causing confusion.
+    stateless_commands: bool = True
 
     @field_validator("wake_phrase")
     @classmethod

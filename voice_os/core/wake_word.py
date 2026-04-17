@@ -64,6 +64,8 @@ class WakeWordListener:
         self._thread: Optional[threading.Thread] = None
         self._oww_model = None
         self._audio_buffer: list[np.ndarray] = []
+        self._stream = None  # sounddevice InputStream; held so pause/resume can stop/start it
+        self._resume_cooldown_until: float = 0.0  # monotonic deadline — suppress detections briefly after resume
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -89,11 +91,40 @@ class WakeWordListener:
         logger.info("Wake-word listener stopped.")
 
     def pause(self) -> None:
-        """Pause detection while the assistant is active/speaking."""
+        """
+        Pause detection while the assistant is active/speaking.
+
+        Stops the PortAudio stream so the VADRecorder can open its own stream on
+        the same device without two concurrent openers causing heap corruption in
+        the C extension (the 'free(): corrupted unsorted chunks' crash).
+        """
         self._paused.clear()
+        s = self._stream
+        if s is not None:
+            try:
+                s.stop()
+            except Exception:
+                pass
 
     def resume(self) -> None:
-        """Resume detection (called when the assistant returns to IDLE)."""
+        """
+        Resume detection (called when the assistant returns to IDLE).
+
+        Discards any audio that accumulated in the buffer while paused (stale
+        data from before we stopped the stream) then restarts the PortAudio
+        stream before unblocking the detection loop.
+        """
+        self._audio_buffer.clear()
+        # Suppress detections for 1 s after resume.  The OWW model carries sliding-window
+        # internal state: audio from just before pause (or TTS room reverb leaking into the
+        # mic) can leave the model primed and cause an immediate false fire at score≈1.0.
+        self._resume_cooldown_until = time.monotonic() + 1.0
+        s = self._stream
+        if s is not None:
+            try:
+                s.start()
+            except Exception:
+                logger.warning("Could not restart WW mic stream on resume; detection may stall.")
         self._paused.set()
         logger.debug("Wake-word listener resumed.")
 
@@ -121,8 +152,8 @@ class WakeWordListener:
 
     def _run(self) -> None:
         """Main detection loop — runs in the background thread."""
-        stream = self._mic.open_input_stream(callback=self._audio_callback)
-        stream.start()
+        self._stream = self._mic.open_input_stream(callback=self._audio_callback)
+        self._stream.start()
         chunks_processed = 0
         try:
             while not self._stop_event.is_set():
@@ -150,6 +181,14 @@ class WakeWordListener:
 
                 for model_name, score in prediction.items():
                     if score >= DETECTION_THRESHOLD:
+                        if time.monotonic() < self._resume_cooldown_until:
+                            # OWW has a sliding-window internal state that can be primed
+                            # from audio just before pause.  Suppress for 1 s after resume.
+                            logger.debug(
+                                "WW: suppressed post-resume detection "
+                                "(model=%s score=%.3f)", model_name, score
+                            )
+                            break
                         logger.info(
                             "Wake word detected! model=%s score=%.3f", model_name, score
                         )
@@ -162,8 +201,13 @@ class WakeWordListener:
         except Exception:
             logger.exception("Wake word run loop crashed.")
         finally:
-            stream.stop()
-            stream.close()
+            s, self._stream = self._stream, None
+            if s is not None:
+                try:
+                    s.stop()
+                except Exception:
+                    pass
+                s.close()
 
     def _audio_callback(self, indata: np.ndarray, frames, time_info, status) -> None:
         """Called by sounddevice on each audio block; feeds the buffer."""

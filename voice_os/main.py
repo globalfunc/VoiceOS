@@ -32,11 +32,51 @@ from voice_os.agent.executor import AgentRunner
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
-    datefmt="%H:%M:%S",
+_LOG_FORMAT = "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s"
+_LOG_DATEFMT = "%H:%M:%S"
+
+# Third-party namespaces that spam at DEBUG/INFO even when we don't need them.
+_NOISY_LOGGERS = (
+    "httpcore",
+    "httpx",
+    "urllib3",
+    "langchain",
+    "langchain_core",
+    "langchain_community",
+    "langgraph",
+    "openai",
+    "asyncio",
+    "ollama",
 )
+
+
+def _configure_logging() -> None:
+    """
+    Set up console logging.
+
+    minimal_debug_logs=True  (default): root at WARNING, voice_os.* at INFO,
+                                        all known noisy third-party loggers
+                                        silenced to WARNING.
+    minimal_debug_logs=False           : root at DEBUG — full firehose.
+    """
+    if settings.minimal_debug_logs:
+        logging.basicConfig(
+            level=logging.WARNING,
+            format=_LOG_FORMAT,
+            datefmt=_LOG_DATEFMT,
+        )
+        logging.getLogger("voice_os").setLevel(logging.INFO)
+        for name in _NOISY_LOGGERS:
+            logging.getLogger(name).setLevel(logging.WARNING)
+    else:
+        logging.basicConfig(
+            level=logging.DEBUG,
+            format=_LOG_FORMAT,
+            datefmt=_LOG_DATEFMT,
+        )
+
+
+_configure_logging()
 logger = logging.getLogger("voice_os.main")
 
 # Dedicated conversation log — one line per user turn, tool execution, and response.

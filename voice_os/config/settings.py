@@ -31,12 +31,13 @@ class DefaultApps(BaseModel):
 class Settings(BaseModel):
     mic_device_id: Optional[int] = None
     wake_phrase: str = Field(default="OS Assistant", max_length=25)
-    llm_model: str = "mistral"
+    llm_model: str = "qwen2.5:7b"
     tts_engine: str = Field(default="kokoro", pattern="^(kokoro|pyttsx3)$")
     whitelisted_dirs: List[str] = Field(default_factory=list)
     default_apps: DefaultApps = Field(default_factory=DefaultApps)
     ollama_base_url: str = "http://localhost:11434"
     ui_port: int = Field(default=7860, ge=1024, le=65535)
+    minimal_debug_logs: bool = True
 
     @field_validator("wake_phrase")
     @classmethod

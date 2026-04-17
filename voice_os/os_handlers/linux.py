@@ -40,127 +40,89 @@ class LinuxHandler(OSHandler):
             return False
 
     def find_app(self, name: str) -> Optional[str]:
+        # 1. Fast exact binary lookup in PATH.
         path = shutil.which(name)
         if path:
             return path
-        # Fuzzy search in .desktop files
-        try:
-            result = subprocess.run(
-                ["grep", "-ril", name, "/usr/share/applications"],
-                capture_output=True, text=True, timeout=3,
-            )
-            if result.stdout.strip():
-                return result.stdout.strip().splitlines()[0]
-        except Exception:
-            pass
+        # 2. Exact case-insensitive match against the catalog — reuses the
+        #    already-built LinuxAppCatalog instead of grepping /usr/share/applications.
+        name_lower = name.lower().strip()
+        for entry in self._catalog():
+            if entry["display_name"].lower() == name_lower:
+                return entry["launch_path"]
+            exec_base = os.path.basename(entry["launch_path"]).replace(".desktop", "").lower()
+            if exec_base == name_lower:
+                return entry["launch_path"]
         return None
 
     def list_apps(self) -> List[str]:
-        """Return executable names from /usr/share/applications *.desktop files."""
-        apps: List[str] = []
-        try:
-            result = subprocess.run(
-                ["grep", "-rh", "^Exec=", "/usr/share/applications"],
-                capture_output=True, text=True, timeout=5,
-            )
-            for line in result.stdout.splitlines():
-                # Exec=firefox %u → firefox
-                exe = line.removeprefix("Exec=").split()[0]
-                exe = re.sub(r"[^a-zA-Z0-9_\-./]", "", exe)
-                if exe:
-                    apps.append(exe)
-        except Exception as exc:
-            logger.warning("list_apps: %s", exc)
-        return sorted(set(apps))
+        """Return executable names from the catalog."""
+        return sorted({
+            os.path.basename(e["launch_path"]).replace(".desktop", "")
+            for e in self._catalog()
+        })
 
-    def _build_app_catalog(self) -> List[Tuple[str, str]]:
+    def _catalog(self) -> List[dict]:
+        """Return the shared user-app catalog (built once, cached)."""
+        from voice_os.os_handlers.app_catalog import LinuxAppCatalog
+        return LinuxAppCatalog.build()
+
+    def search_apps(
+        self, query: str, top_n: int = 5
+    ) -> List[Tuple[str, str, float]]:
         """
-        Build a catalog of installed applications from all known sources.
-
-        Sources (in order):
-        1. .desktop files — /usr/share/applications, snap, flatpak, and user dirs.
-           Gives nice display names (e.g. "dbeaver-ce" for the snap).
-        2. PATH executables — every executable found in $PATH that wasn't already
-           covered by a .desktop entry.  Catches AppImages, manual installs, etc.
-
-        Returns [(display_name, launch_path), ...].
+        Search installed apps by name, generic name, and categories.
+        Returns [(display_name, launch_path, score), ...] sorted descending.
         """
-        import glob as _glob
+        def _norm(s: str) -> str:
+            return re.sub(r"[\s\-_/;,]", "", s).lower()
 
-        catalog: List[Tuple[str, str]] = []
-        seen_exec: set = set()   # lower-cased binary base-names already in catalog
+        q_norm = _norm(query)
+        q_words = [w for w in query.lower().split() if len(w) > 2]
 
-        desktop_dirs = [
-            "/usr/share/applications",
-            "/var/lib/snapd/desktop/applications",                           # snap
-            "/var/lib/flatpak/exports/share/applications",                  # flatpak (system)
-            os.path.expanduser("~/.local/share/applications"),
-            os.path.expanduser("~/.local/share/flatpak/exports/share/applications"),  # flatpak (user)
-        ]
-        for desktop_dir in desktop_dirs:
-            try:
-                for fpath in _glob.glob(os.path.join(desktop_dir, "*.desktop")):
-                    name: Optional[str] = None
-                    exec_bin: Optional[str] = None
-                    try:
-                        with open(fpath, encoding="utf-8", errors="replace") as f:
-                            for line in f:
-                                line = line.strip()
-                                if line.startswith("Name=") and name is None:
-                                    name = line[5:].strip()
-                                elif line.startswith("Exec=") and exec_bin is None:
-                                    tokens = line[5:].strip().split()
-                                    if tokens:
-                                        cmd = re.sub(r"%\w", "", tokens[0]).strip()
-                                        exec_bin = cmd or None
-                    except Exception:
-                        continue
-                    if not name or not exec_bin:
-                        continue
-                    launch = shutil.which(exec_bin) or fpath
-                    catalog.append((name, launch))
-                    seen_exec.add(os.path.basename(exec_bin).lower())
-            except Exception as exc:
-                logger.warning("_build_app_catalog (%s): %s", desktop_dir, exc)
+        scored: List[Tuple[str, str, float]] = []
+        for entry in self._catalog():
+            display_name: str = entry["display_name"]
+            launch_path: str  = entry["launch_path"]
 
-        # Supplement with PATH executables not already covered by a .desktop file.
-        for dir_path in os.environ.get("PATH", "").split(os.pathsep):
-            try:
-                if not os.path.isdir(dir_path):
-                    continue
-                for entry in os.scandir(dir_path):
-                    if entry.is_file() and os.access(entry.path, os.X_OK):
-                        if entry.name.lower() not in seen_exec:
-                            catalog.append((entry.name, entry.path))
-                            seen_exec.add(entry.name.lower())
-            except Exception:
-                continue
+            base  = difflib.SequenceMatcher(None, q_norm, _norm(display_name)).ratio()
+            generic = entry.get("generic_name", "").lower()
+            cats    = entry.get("categories",   "").lower()
 
-        return catalog
+            boost = 0.0
+            for word in q_words:
+                if word in generic or word in cats:
+                    boost = max(boost, 0.5)
+                elif word in display_name.lower():
+                    boost = max(boost, 0.15)
+
+            score = min(1.0, base + boost)
+            if score >= 0.35:
+                scored.append((display_name, launch_path, score))
+
+        scored.sort(key=lambda x: x[2], reverse=True)
+        return scored[:top_n]
+
+    def list_app_names(self, top_n: int = 200) -> List[str]:
+        """Return sorted display names for Whisper vocabulary building."""
+        names = sorted({e["display_name"] for e in self._catalog()})
+        return names[:top_n]
 
     def find_app_candidates(
         self, query: str, top_n: int = 3, min_score: float = 0.5
     ) -> List[Tuple[str, str, float]]:
         """
-        Fuzzy-match ``query`` against installed desktop apps.
-
-        Normalises both sides (lowercase, strip spaces/dashes/underscores) then
-        computes difflib SequenceMatcher ratio against both the display name
-        and the executable name.  Returns up to ``top_n`` results with score
-        >= ``min_score``, sorted descending.
-
-        Examples that work:
-          "db beaver"   → DBeaver  (score ~0.93 after normalising "dbbeaver"/"dbeaver")
-          "haydysql"    → HeidiSQL (score ~0.63 for "haydysql"/"heidisql")
+        Fuzzy-match ``query`` against installed app display names and executable names.
+        Returns up to ``top_n`` results with score >= ``min_score``, sorted descending.
         """
-        catalog = self._build_app_catalog()
-
         def _norm(s: str) -> str:
             return re.sub(r"[\s\-_]", "", s).lower()
 
         q = _norm(query)
         scored: List[Tuple[str, str, float]] = []
-        for display_name, launch_path in catalog:
+        for entry in self._catalog():
+            display_name: str = entry["display_name"]
+            launch_path: str  = entry["launch_path"]
             dn = _norm(display_name)
             en = _norm(os.path.basename(launch_path).replace(".desktop", ""))
             score = max(
@@ -177,18 +139,21 @@ class LinuxHandler(OSHandler):
     # Process management
     # ------------------------------------------------------------------
 
-    def find_processes(self, name: str) -> List[Tuple[int, str]]:
+    def find_processes(self, name: str, fullcmd: bool = True) -> List[Tuple[int, str]]:
         """
-        Find running processes whose full command line contains ``name``
-        (case-insensitive substring via pgrep -af).
-
-        Returns [(pid, comm), ...].  The current process is excluded so
-        VoiceOS can never accidentally close itself.
+        Find running processes matching ``name``.
+        fullcmd=True  — pgrep -af: search the full command line (default).
+        fullcmd=False — pgrep -a: match only the process comm/binary name.
+                        Use when you have an exact exec name from the catalog
+                        to avoid false positives from cmdline paths/args
+                        (e.g. "obs" matching ".../models/blobs/sha256-...").
+        Returns [(pid, comm), ...].  The current process is excluded.
         """
         my_pid = os.getpid()
+        flags = ["-af"] if fullcmd else ["-a"]
         try:
             result = subprocess.run(
-                ["pgrep", "-af", name],
+                ["pgrep"] + flags + [name],
                 capture_output=True, text=True, timeout=5,
             )
         except Exception as exc:

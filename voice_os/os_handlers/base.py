@@ -27,6 +27,24 @@ class OSHandler(ABC):
     def list_apps(self) -> List[str]:
         """List installed / known application names (best-effort)."""
 
+    def search_apps(
+        self, query: str, top_n: int = 5
+    ) -> List[Tuple[str, str, float]]:
+        """
+        Search installed apps by name, generic name, category, or description.
+        Richer than find_app_candidates — handles queries like "database",
+        "SQL client", "web browser".  Returns [(display_name, launch_path, score), ...].
+        Default: empty list.  Platform handlers override.
+        """
+        return []
+
+    def list_app_names(self, top_n: int = 200) -> List[str]:
+        """
+        Return display names of installed apps (for Whisper vocabulary building).
+        Default: empty list.  Platform handlers override.
+        """
+        return []
+
     def find_app_candidates(
         self, query: str, top_n: int = 3, min_score: float = 0.5
     ) -> List[Tuple[str, str, float]]:
@@ -44,10 +62,16 @@ class OSHandler(ABC):
     # Process management
     # ------------------------------------------------------------------
 
-    def find_processes(self, name: str) -> List[Tuple[int, str]]:
+    def find_processes(self, name: str, fullcmd: bool = True) -> List[Tuple[int, str]]:
         """
-        Find running processes whose command line contains ``name`` (substring,
-        case-insensitive).  Returns [(pid, process_name), ...].
+        Find running processes matching ``name``.
+        fullcmd=True  — search the full command line (pgrep -af).  Good for
+                        user-typed names where the binary may be deep in a path.
+        fullcmd=False — match only the process comm/binary name (pgrep -a).
+                        Use this when you have an exact exec name from the catalog
+                        to avoid substring false-positives in cmdline arguments
+                        (e.g. "obs" matching ".../models/blobs/...").
+        Returns [(pid, process_name), ...].
         Default: empty list.  Platform handlers override.
         """
         return []

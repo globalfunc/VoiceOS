@@ -35,10 +35,7 @@ class CloseAppTool(BaseTool):
     """Close / quit a running application by name."""
 
     name: str = "close_app"
-    description: str = (
-        "Close or quit a running application by name. "
-        "Examples: close Firefox, quit DBeaver, exit terminal."
-    )
+    description: str = "Close or quit a running application by name."
     args_schema: Type[BaseModel] = _CloseAppInput
 
     # Injected by AgentRunner for interactive confirmation.

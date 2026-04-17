@@ -44,8 +44,7 @@ class OpenAppTool(BaseTool):
 
     name: str = "open_app"
     description: str = (
-        "Open an application by name, or open a file with a specific or default app. "
-        "Examples: open Firefox, open terminal, open /home/user/report.pdf with evince."
+        "Open or launch an application by name, or open a file with a specific or default app."
     )
     args_schema: Type[BaseModel] = _OpenAppInput
 

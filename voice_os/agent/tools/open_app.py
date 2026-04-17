@@ -89,7 +89,10 @@ class OpenAppTool(BaseTool):
             return self._launch(app_name, app_path)
 
         # ── Case 3: exact match failed — try fuzzy candidates ─────────
-        candidates = handler.find_app_candidates(app_name, top_n=1)
+        # Fetch top-2 so we can distinguish "only one match" from "ambiguous".
+        from voice_os.config.settings import settings as _settings
+        _auto_score = _settings.fuzzy_auto_open_min_score
+        candidates = handler.find_app_candidates(app_name, top_n=2)
         if not candidates:
             return (
                 f"Could not find '{app_name}'. "
@@ -102,7 +105,16 @@ class OpenAppTool(BaseTool):
             app_name, display_name, score,
         )
 
-        # If we have voice callbacks, ask the user to confirm.
+        # Single unambiguous match above threshold → open directly, no confirmation.
+        if len(candidates) == 1 and score > _auto_score:
+            logger.info(
+                "open_app: cannot find %r exactly → fuzzy returned only '%s' "
+                "(score=%.2f) → opening without confirmation",
+                app_name, display_name, score,
+            )
+            return self._launch(display_name, launch_path)
+
+        # Multiple candidates or ambiguous — ask the user to confirm.
         if self.speak and self.listen_for_response:
             self.speak(
                 f"I couldn't find {app_name}. "

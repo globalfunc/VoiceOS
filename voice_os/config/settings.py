@@ -45,6 +45,10 @@ class Settings(BaseModel):
     # When True, session history is NOT injected into agent messages.
     # Useful for isolating whether multi-turn context is causing confusion.
     stateless_commands: bool = True
+    # Minimum fuzzy-match score (0–1) for auto-opening/closing an app without
+    # asking for voice confirmation, when there is exactly one candidate above
+    # this threshold.  Lower = more aggressive auto-selection.
+    fuzzy_auto_open_min_score: float = Field(default=0.5, ge=0.0, le=1.0)
 
     @field_validator("wake_phrase")
     @classmethod

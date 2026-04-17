@@ -62,7 +62,9 @@ class CloseAppTool(BaseTool):
         # the app name in a path argument (e.g. java running /opt/dbeaver/...).
         # pgrep still does regex substring matching on comm, so "dbeaver"
         # matches comm="dbeaver-ce" and "obs" matches comm="obs".
-        raw_matches = handler.find_processes(app_name, fullcmd=False)
+        # Lowercase so "Chrome" matches the "chrome" process (pgrep is
+        # case-sensitive on Linux).
+        raw_matches = handler.find_processes(app_name.lower(), fullcmd=False)
         # Filter out crash-reporter and helper processes — they share the
         # parent app's name in their path but are not the app itself.
         # Closing helpers instead of the browser is a common false-positive.
@@ -79,7 +81,9 @@ class CloseAppTool(BaseTool):
         # This mirrors how open_app resolves multi-word product names to their
         # real binary name, and avoids needing "studio" to appear in the cmdline.
         if not raw_matches:
-            app_candidates = handler.find_app_candidates(app_name, top_n=1)
+            from voice_os.config.settings import settings as _settings
+            _auto_score = _settings.fuzzy_auto_open_min_score
+            app_candidates = handler.find_app_candidates(app_name, top_n=2)
             if app_candidates:
                 display_name, launch_path, app_score = app_candidates[0]
                 exec_name = _os.path.basename(launch_path)
@@ -97,11 +101,17 @@ class CloseAppTool(BaseTool):
                             "(catalog score=%.2f)",
                             app_name, exec_name, len(bridged), app_score,
                         )
-                        # Only ask for confirmation when the catalog match is
-                        # uncertain (score < 0.8).  High-confidence matches
-                        # (e.g. "obs studio" → "OBS Studio", score=1.0) close
-                        # directly without interrupting the user.
-                        if app_score < 0.8 and self.speak and self.listen_for_response:
+                        # Auto-close when: single unambiguous catalog match above
+                        # threshold, OR any high-confidence match (≥0.8).
+                        is_only_candidate = len(app_candidates) == 1
+                        if (is_only_candidate and app_score > _auto_score) or app_score >= 0.8:
+                            logger.info(
+                                "close_app: cannot find %r exactly → "
+                                "catalog matched '%s' (only=%s, score=%.2f) → "
+                                "closing without confirmation",
+                                app_name, display_name, is_only_candidate, app_score,
+                            )
+                        elif self.speak and self.listen_for_response:
                             self.speak(
                                 f"I couldn't find {app_name}. "
                                 f"Did you mean {display_name}? "
@@ -114,6 +124,8 @@ class CloseAppTool(BaseTool):
         # ── Step 2: fuzzy match against running process names ──────────
         # Last resort — handles STT mis-transcriptions like "haydysql" → heidisql.
         if not raw_matches:
+            from voice_os.config.settings import settings as _settings
+            _auto_score = _settings.fuzzy_auto_open_min_score
             fuzzy = handler.find_processes_fuzzy(app_name, min_score=0.5)
             if not fuzzy:
                 return f"No running process found matching '{app_name}'."
@@ -124,7 +136,14 @@ class CloseAppTool(BaseTool):
                 app_name, proc_name, score,
             )
 
-            if self.speak and self.listen_for_response:
+            # Single unambiguous fuzzy match above threshold → close directly.
+            if len(fuzzy) == 1 and score > _auto_score:
+                logger.info(
+                    "close_app: cannot find %r exactly → fuzzy returned only '%s' "
+                    "(score=%.2f) → closing without confirmation",
+                    app_name, proc_name, score,
+                )
+            elif self.speak and self.listen_for_response:
                 self.speak(
                     f"I couldn't find {app_name}. "
                     f"Did you mean {proc_name}? "

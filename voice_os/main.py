@@ -21,6 +21,8 @@ import signal
 import threading
 from enum import Enum, auto
 
+import numpy as np
+
 from voice_os.config.settings import settings
 from voice_os.core.mic_manager import MicManager
 from voice_os.core.wake_word import WakeWordListener
@@ -188,7 +190,7 @@ class VoiceAssistant:
     # State transitions
     # ------------------------------------------------------------------
 
-    def _on_wake_word(self) -> None:
+    def _on_wake_word(self, trailing_audio: np.ndarray) -> None:
         """Called by WakeWordListener when the wake phrase is detected."""
         with self._state_lock:
             if self._state != State.IDLE:
@@ -202,27 +204,36 @@ class VoiceAssistant:
 
         self._reset_idle_timer()
         threading.Thread(
-            target=self._capture_and_respond_safe, daemon=True
+            target=self._capture_and_respond_safe,
+            args=(trailing_audio,),
+            daemon=True,
         ).start()
 
-    def _capture_and_respond_safe(self) -> None:
+    def _capture_and_respond_safe(self, trailing_audio: np.ndarray) -> None:
         try:
-            self._capture_and_respond()
+            self._capture_and_respond(trailing_audio)
         except Exception:
             logger.exception(
                 "Unhandled error in capture/respond pipeline — returning to IDLE."
             )
             self._go_idle()
 
-    def _capture_and_respond(self) -> None:
+    def _capture_and_respond(self, trailing_audio: np.ndarray) -> None:
         """ACTIVE → PROCESSING → SPEAKING → IDLE."""
 
-        # --- ACTIVE: signal to user, then capture utterance ---
-        # WW listener is already paused (paused by WakeWordListener._run
-        # before calling on_detected); _speak() double-pauses safely.
-        logger.info("[ACTIVE] Capturing utterance via VAD…")
-        self._speak("Listening.")
-        audio = self._vad.record_until_silence()
+        # --- ACTIVE: capture utterance ---
+        # Start VAD immediately after wake-word detection — no blocking TTS prompt.
+        # Speaking "Listening." delays VAD by ~500 ms during which the user's
+        # command is already being spoken and gets lost.  VAD will record until
+        # the user stops speaking; trailing_audio (buffered during WW detection)
+        # is prepended so nothing is dropped at the seam.
+        logger.info(
+            "[ACTIVE] Capturing utterance via VAD (%d trailing samples from WW)…",
+            len(trailing_audio),
+        )
+        audio = self._vad.record_until_silence(
+            prefix_audio=trailing_audio if len(trailing_audio) > 0 else None
+        )
         self._reset_idle_timer()
 
         # --- PROCESSING: transcribe ---
@@ -232,16 +243,14 @@ class VoiceAssistant:
         self._reset_idle_timer()
 
         if not raw_text:
-            logger.warning("Transcription returned empty — returning to IDLE.")
-            self._speak("Sorry, I didn't catch that.")
+            logger.warning("Transcription returned empty — returning to IDLE silently.")
             self._go_idle()
             return
 
         # Strip wake-phrase prefix that Whisper may include in the transcript.
         text = _WAKE_WORD_TOKENS.sub("", raw_text).strip()
         if not text:
-            logger.warning("Nothing left after stripping wake phrase — returning to IDLE.")
-            self._speak("Sorry, I didn't catch that.")
+            logger.warning("Nothing left after stripping wake phrase — returning to IDLE silently.")
             self._go_idle()
             return
 
@@ -251,7 +260,7 @@ class VoiceAssistant:
         if _DISMISS_PATTERN.match(text):
             logger.info("[PROCESSING] Dismiss command detected — going idle.")
             self._agent.clear_session()
-            self._speak("Goodbye. Say the wake word when you need me.")
+            self._speak("Goodbye.")
             self._go_idle()
             return
 
@@ -281,7 +290,6 @@ class VoiceAssistant:
         logger.info("Idle timeout fired (state=%s).", current.name)
         if current == State.IDLE:
             # Mute WW while speaking so TTS doesn't trigger itself.
-            self._speak("Going to idle state.")
             self._ww.resume()          # resume — still idle after speaking
             self._agent.clear_session()
 

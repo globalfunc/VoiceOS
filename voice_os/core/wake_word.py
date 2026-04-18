@@ -53,7 +53,7 @@ class WakeWordListener:
 
     def __init__(
         self,
-        on_detected: Callable[[], None],
+        on_detected: Callable[[np.ndarray], None],
         mic_manager: Optional[MicManager] = None,
     ) -> None:
         self._on_detected = on_detected
@@ -192,9 +192,17 @@ class WakeWordListener:
                         logger.info(
                             "Wake word detected! model=%s score=%.3f", model_name, score
                         )
+                        # Capture any audio already buffered after the detection
+                        # chunk — it may contain the start of an inline command
+                        # (e.g. "Alexa, close firefox" said in one breath).
+                        trailing: np.ndarray = (
+                            np.concatenate(self._audio_buffer)
+                            if self._audio_buffer
+                            else np.array([], dtype=np.int16)
+                        )
                         self.pause()
                         try:
-                            self._on_detected()
+                            self._on_detected(trailing)
                         except Exception:
                             logger.exception("Exception in on_detected callback.")
                         break

@@ -46,9 +46,13 @@ class VADRecorder:
     # Public API
     # ------------------------------------------------------------------
 
-    def record_until_silence(self) -> np.ndarray:
+    def record_until_silence(self, prefix_audio: Optional[np.ndarray] = None) -> np.ndarray:
         """
         Block until the user finishes speaking.
+
+        Args:
+            prefix_audio: Optional audio to prepend, e.g. trailing audio captured
+                during wake-word detection (contains the start of an inline command).
 
         Returns:
             np.ndarray: int16 audio samples at SAMPLE_RATE Hz.
@@ -59,6 +63,26 @@ class VADRecorder:
         silence_start: Optional[float] = None
         recording_done = threading.Event()
         result_frames: list[np.ndarray] = []
+
+        # Pre-process any prefix audio (trailing WW buffer) through the VAD so
+        # that speech_started and silence_start are already set correctly when
+        # the live stream opens.  This captures the portion of an inline command
+        # that was spoken concurrently with or just after the wake word.
+        if prefix_audio is not None and len(prefix_audio) > 0:
+            audio_frames.append(prefix_audio)
+            buf = prefix_audio.copy()
+            while len(buf) >= _SILERO_CHUNK:
+                window = buf[:_SILERO_CHUNK]
+                buf = buf[_SILERO_CHUNK:]
+                prob = self._vad_probability(window)
+                if prob >= _VAD_THRESHOLD:
+                    speech_started = True
+                    silence_start = None
+                elif speech_started and silence_start is None:
+                    silence_start = time.monotonic()
+            # Seed the live buffer with any sub-chunk remainder
+            if len(buf) > 0:
+                vad_chunk_buffer.append(buf)
 
         def callback(indata: np.ndarray, frames, time_info, status):
             nonlocal speech_started, silence_start

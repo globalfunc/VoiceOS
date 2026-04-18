@@ -313,6 +313,8 @@ class AgentRunner:
         from voice_os.agent.tools.close_app import CloseAppTool
         from voice_os.agent.tools.system_control import SystemControlTool
         from voice_os.agent.tools.search_apps import SearchAppsTool
+        from voice_os.agent.tools.search_files import SearchFilesTool
+        from voice_os.agent.tools.play_media import PlayMediaTool
 
         # --- Build tools -----------------------------------------------
         try:
@@ -331,6 +333,8 @@ class AgentRunner:
                     listen_for_cancel=self._listen_for_cancel,
                 ),
                 SearchAppsTool(),
+                SearchFilesTool(),
+                PlayMediaTool(),
             ]
             logger.debug("AgentRunner: tools built: %s", [t.name for t in tools])
         except Exception as exc:
